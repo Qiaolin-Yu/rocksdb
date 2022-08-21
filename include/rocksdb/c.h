@@ -949,6 +949,28 @@ extern ROCKSDB_LIBRARY_API rocksdb_iterator_t* rocksdb_writebatch_wi_create_iter
     rocksdb_iterator_t* base_iterator,
     rocksdb_column_family_handle_t* cf);
 
+/* Options utils */
+
+// Load the latest rocksdb options from the specified db_path.
+//
+// On success, num_column_families will be updated with a non-zero
+// number indicating the number of column families.
+// The returned db_options, column_family_names, and column_family_options
+// should be released via rocksdb_load_latest_options_destroy().
+//
+// On error, a non-null errptr that includes the error message will be
+// returned.  db_options, column_family_names, and column_family_options
+// will be set to NULL.
+extern ROCKSDB_LIBRARY_API void rocksdb_load_latest_options(
+    const char* db_path, rocksdb_env_t* env, bool ignore_unknown_options,
+    rocksdb_cache_t* cache, rocksdb_options_t** db_options,
+    size_t* num_column_families, char*** column_family_names,
+    rocksdb_options_t*** column_family_options, char** errptr);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_load_latest_options_destroy(
+    rocksdb_options_t* db_options, char** list_column_family_names,
+    rocksdb_options_t** list_column_family_options, size_t len);
+
 /* Block based table options */
 
 extern ROCKSDB_LIBRARY_API rocksdb_block_based_table_options_t*
@@ -1279,6 +1301,17 @@ extern ROCKSDB_LIBRARY_API int rocksdb_options_get_blob_file_starting_level(
 
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_blob_cache(
     rocksdb_options_t* opt, rocksdb_cache_t* blob_cache);
+
+enum {
+  rocksdb_prepopulate_blob_disable = 0,
+  rocksdb_prepopulate_blob_flush_only = 1
+};
+
+extern ROCKSDB_LIBRARY_API void rocksdb_options_set_prepopulate_blob_cache(
+    rocksdb_options_t* opt, int val);
+
+extern ROCKSDB_LIBRARY_API int rocksdb_options_get_prepopulate_blob_cache(
+    rocksdb_options_t* opt);
 
 /* returns a pointer to a malloc()-ed, null terminated string */
 extern ROCKSDB_LIBRARY_API char* rocksdb_options_statistics_get_string(
@@ -1668,7 +1701,13 @@ enum {
   rocksdb_env_unlock_file_nanos,
   rocksdb_env_new_logger_nanos,
   rocksdb_number_async_seek,
-  rocksdb_total_metric_count = 69
+  rocksdb_blob_cache_hit_count,
+  rocksdb_blob_read_count,
+  rocksdb_blob_read_byte,
+  rocksdb_blob_read_time,
+  rocksdb_blob_checksum_time,
+  rocksdb_blob_decompress_time,
+  rocksdb_total_metric_count = 77
 };
 
 extern ROCKSDB_LIBRARY_API void rocksdb_set_perf_level(int);
@@ -1939,6 +1978,8 @@ extern ROCKSDB_LIBRARY_API void rocksdb_lru_cache_options_destroy(
     rocksdb_lru_cache_options_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_lru_cache_options_set_capacity(
     rocksdb_lru_cache_options_t*, size_t);
+extern ROCKSDB_LIBRARY_API void rocksdb_lru_cache_options_set_num_shard_bits(
+    rocksdb_lru_cache_options_t*, int);
 extern ROCKSDB_LIBRARY_API void rocksdb_lru_cache_options_set_memory_allocator(
     rocksdb_lru_cache_options_t*, rocksdb_memory_allocator_t*);
 
@@ -2031,13 +2072,15 @@ extern ROCKSDB_LIBRARY_API void rocksdb_sstfilewriter_delete(
 extern ROCKSDB_LIBRARY_API void rocksdb_sstfilewriter_delete_with_ts(
     rocksdb_sstfilewriter_t* writer, const char* key, size_t keylen,
     const char* ts, size_t tslen, char** errptr);
+extern ROCKSDB_LIBRARY_API void rocksdb_sstfilewriter_delete_range(
+    rocksdb_sstfilewriter_t* writer, const char* begin_key, size_t begin_keylen,
+    const char* end_key, size_t end_keylen, char** errptr);
 extern ROCKSDB_LIBRARY_API void rocksdb_sstfilewriter_finish(
     rocksdb_sstfilewriter_t* writer, char** errptr);
 extern ROCKSDB_LIBRARY_API void rocksdb_sstfilewriter_file_size(
     rocksdb_sstfilewriter_t* writer, uint64_t* file_size);
 extern ROCKSDB_LIBRARY_API void rocksdb_sstfilewriter_destroy(
     rocksdb_sstfilewriter_t* writer);
-
 extern ROCKSDB_LIBRARY_API rocksdb_ingestexternalfileoptions_t*
 rocksdb_ingestexternalfileoptions_create(void);
 extern ROCKSDB_LIBRARY_API void

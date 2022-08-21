@@ -46,6 +46,10 @@
 #include "db/version_edit.h"
 #include "db/write_controller.h"
 #include "env/file_system_tracer.h"
+#if USE_COROUTINES
+#include "folly/experimental/coro/BlockingWait.h"
+#include "folly/experimental/coro/Collect.h"
+#endif
 #include "monitoring/instrumented_mutex.h"
 #include "options/db_options.h"
 #include "port/port.h"
@@ -54,6 +58,7 @@
 #include "table/get_context.h"
 #include "table/multiget_context.h"
 #include "trace_replay/block_cache_tracer.h"
+#include "util/autovector.h"
 #include "util/coro_utils.h"
 #include "util/hash_containers.h"
 
@@ -76,6 +81,7 @@ class ColumnFamilySet;
 class MergeIteratorBuilder;
 class SystemClock;
 class ManifestTailer;
+class FilePickerMultiGet;
 
 // VersionEdit is always supposed to be valid and it is used to point at
 // entries in Manifest. Ideally it should not be used as a container to
@@ -146,10 +152,12 @@ class VersionStorageInfo {
   }
 
   // REQUIRES: lock is held
-  // Update the compact cursor and advance the file index so that it can point
-  // to the next cursor
-  const InternalKey& GetNextCompactCursor(int level) {
-    int cmp_idx = next_file_to_compact_by_size_[level] + 1;
+  // Update the compact cursor and advance the file index using increment
+  // so that it can point to the next cursor (increment means the number of
+  // input files in this level of the last compaction)
+  const InternalKey& GetNextCompactCursor(int level, size_t increment) {
+    int cmp_idx = next_file_to_compact_by_size_[level] + (int)increment;
+    assert(cmp_idx <= (int)files_by_compaction_pri_[level].size());
     // TODO(zichen): may need to update next_file_to_compact_by_size_
     // for parallel compaction.
     InternalKey new_cursor;
@@ -834,7 +842,8 @@ class Version {
   // REQUIRES: lock is not held
   // REQUIRES: pinned_iters_mgr != nullptr
   void Get(const ReadOptions&, const LookupKey& key, PinnableSlice* value,
-           std::string* timestamp, Status* status, MergeContext* merge_context,
+           PinnableWideColumns* columns, std::string* timestamp, Status* status,
+           MergeContext* merge_context,
            SequenceNumber* max_covering_tombstone_seq,
            PinnedIteratorsManager* pinned_iters_mgr,
            bool* value_found = nullptr, bool* key_exists = nullptr,
@@ -860,11 +869,11 @@ class Version {
                  FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
                  uint64_t* bytes_read) const;
 
-  using BlobReadRequest =
+  using BlobReadContext =
       std::pair<BlobIndex, std::reference_wrapper<const KeyContext>>;
-  using BlobReadRequests = std::vector<BlobReadRequest>;
+  using BlobReadContexts = std::vector<BlobReadContext>;
   void MultiGetBlob(const ReadOptions& read_options, MultiGetRange& range,
-                    std::unordered_map<uint64_t, BlobReadRequests>& blob_rqs);
+                    std::unordered_map<uint64_t, BlobReadContexts>& blob_ctxs);
 
   // Loads some stats information from files (if update_stats is set) and
   // populates derived data structures. Call without mutex held. It needs to be
@@ -988,10 +997,33 @@ class Version {
   DECLARE_SYNC_AND_ASYNC(
       /* ret_type */ Status, /* func_name */ MultiGetFromSST,
       const ReadOptions& read_options, MultiGetRange file_range,
-      int hit_file_level, bool is_hit_file_last_in_level, FdWithKeyRange* f,
-      std::unordered_map<uint64_t, BlobReadRequests>& blob_rqs,
-      uint64_t& num_filter_read, uint64_t& num_index_read,
-      uint64_t& num_sst_read);
+      int hit_file_level, bool skip_filters, bool skip_range_deletions,
+      FdWithKeyRange* f,
+      std::unordered_map<uint64_t, BlobReadContexts>& blob_ctxs,
+      Cache::Handle* table_handle, uint64_t& num_filter_read,
+      uint64_t& num_index_read, uint64_t& num_sst_read);
+
+#ifdef USE_COROUTINES
+  // MultiGet using async IO to read data blocks from SST files in parallel
+  // within and across levels
+  Status MultiGetAsync(
+      const ReadOptions& options, MultiGetRange* range,
+      std::unordered_map<uint64_t, BlobReadContexts>* blob_ctxs);
+
+  // A helper function to lookup a batch of keys in a single level. It will
+  // queue coroutine tasks to mget_tasks. It may also split the input batch
+  // by creating a new batch with keys definitely not in this level and
+  // enqueuing it to to_process.
+  Status ProcessBatch(const ReadOptions& read_options,
+                      FilePickerMultiGet* batch,
+                      std::vector<folly::coro::Task<Status>>& mget_tasks,
+                      std::unordered_map<uint64_t, BlobReadContexts>* blob_ctxs,
+                      autovector<FilePickerMultiGet, 4>& batches,
+                      std::deque<size_t>& waiting,
+                      std::deque<size_t>& to_process,
+                      unsigned int& num_tasks_queued, uint64_t& num_filter_read,
+                      uint64_t& num_index_read, uint64_t& num_sst_read);
+#endif
 
   ColumnFamilyData* cfd_;  // ColumnFamilyData to which this Version belongs
   Logger* info_log_;

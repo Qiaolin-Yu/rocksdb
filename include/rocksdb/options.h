@@ -240,18 +240,36 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   int level0_file_num_compaction_trigger = 4;
 
-  // If non-nullptr, use the specified function to determine the
-  // prefixes for keys.  These prefixes will be placed in the filter.
-  // Depending on the workload, this can reduce the number of read-IOP
-  // cost for scans when a prefix is passed via ReadOptions to
-  // db.NewIterator().  For prefix filtering to work properly,
-  // "prefix_extractor" and "comparator" must be such that the following
-  // properties hold:
+  // If non-nullptr, use the specified function to put keys in contiguous
+  // groups called "prefixes". These prefixes are used to place one
+  // representative entry for the group into the Bloom filter
+  // rather than an entry for each key (see whole_key_filtering).
+  // Under certain conditions, this enables optimizing some range queries
+  // (Iterators) in addition to some point lookups (Get/MultiGet).
   //
-  // 1) key.starts_with(prefix(key))
-  // 2) Compare(prefix(key), key) <= 0.
-  // 3) If Compare(k1, k2) <= 0, then Compare(prefix(k1), prefix(k2)) <= 0
-  // 4) prefix(prefix(key)) == prefix(key)
+  // Together `prefix_extractor` and `comparator` must satisfy one essential
+  // property for valid prefix filtering of range queries:
+  //   If Compare(k1, k2) <= 0 and Compare(k2, k3) <= 0 and
+  //      InDomain(k1) and InDomain(k3) and prefix(k1) == prefix(k3),
+  //   Then InDomain(k2) and prefix(k2) == prefix(k1)
+  //
+  // In other words, all keys with the same prefix must be in a contiguous
+  // group by comparator order, and cannot be interrupted by keys with no
+  // prefix ("out of domain"). (This makes it valid to conclude that no
+  // entries within some bounds are present if the upper and lower bounds
+  // have a common prefix and no entries with that same prefix are present.)
+  //
+  // Some other properties are recommended but not strictly required. Under
+  // most sensible comparators, the following will need to hold true to
+  // satisfy the essential property above:
+  // * "Prefix is a prefix": key.starts_with(prefix(key))
+  // * "Prefixes preserve ordering": If Compare(k1, k2) <= 0, then
+  //   Compare(prefix(k1), prefix(k2)) <= 0
+  //
+  // The next two properties ensure that seeking to a prefix allows
+  // enumerating all entries with that prefix:
+  // * "Prefix starts the group": Compare(prefix(key), key) <= 0
+  // * "Prefix idempotent": prefix(prefix(key)) == prefix(key)
   //
   // Default: nullptr
   std::shared_ptr<const SliceTransform> prefix_extractor = nullptr;
@@ -483,11 +501,17 @@ struct DBOptions {
   bool flush_verify_memtable_count = true;
 
   // If true, the log numbers and sizes of the synced WALs are tracked
-  // in MANIFEST, then during DB recovery, if a synced WAL is missing
+  // in MANIFEST. During DB recovery, if a synced WAL is missing
   // from disk, or the WAL's size does not match the recorded size in
   // MANIFEST, an error will be reported and the recovery will be aborted.
   //
+  // This is one additional protection against WAL corruption besides the
+  // per-WAL-entry checksum.
+  //
   // Note that this option does not work with secondary instance.
+  // Currently, only syncing closed WALs are tracked. Calling `DB::SyncWAL()`,
+  // etc. or writing with `WriteOptions::sync=true` to sync the live WAL is not
+  // tracked for performance/efficiency reasons.
   //
   // Default: false
   bool track_and_verify_wals_in_manifest = false;
@@ -881,7 +905,8 @@ struct DBOptions {
   // can be passed into multiple DBs and it will track the sum of size of all
   // the DBs. If the total size of all live memtables of all the DBs exceeds
   // a limit, a flush will be triggered in the next DB to which the next write
-  // is issued.
+  // is issued, as long as there is one or more column family not already
+  // flushing.
   //
   // If the object is only passed to one DB, the behavior is the same as
   // db_write_buffer_size. When write_buffer_manager is set, the value set will
@@ -1446,6 +1471,8 @@ struct ReadOptions {
   // need to have the same prefix. This is because ordering is not guaranteed
   // outside of prefix domain.
   //
+  // In case of user_defined timestamp, if enabled, iterate_lower_bound should
+  // point to key without timestamp part.
   // Default: nullptr
   const Slice* iterate_lower_bound;
 
@@ -1465,6 +1492,8 @@ struct ReadOptions {
   // If iterate_upper_bound is not null, SeekToLast() will position the iterator
   // at the first key smaller than iterate_upper_bound.
   //
+  // In case of user_defined timestamp, if enabled, iterate_upper_bound should
+  // point to key without timestamp part.
   // Default: nullptr
   const Slice* iterate_upper_bound;
 
@@ -1657,6 +1686,17 @@ struct ReadOptions {
   // Default: false
   bool async_io;
 
+  // Experimental
+  //
+  // If async_io is set, then this flag controls whether we read SST files
+  // in multiple levels asynchronously. Enabling this flag can help reduce
+  // MultiGet latency by maximizing the number of SST files read in
+  // parallel if the keys in the MultiGet batch are in different levels. It
+  // comes at the expense of slightly higher CPU overhead.
+  //
+  // Default: false
+  bool optimize_multiget_for_io;
+
   ReadOptions();
   ReadOptions(bool cksum, bool cache);
 };
@@ -1819,8 +1859,11 @@ enum class BlobGarbageCollectionPolicy {
 // CompactRangeOptions is used by CompactRange() call.
 struct CompactRangeOptions {
   // If true, no other compaction will run at the same time as this
-  // manual compaction
-  bool exclusive_manual_compaction = true;
+  // manual compaction.
+  //
+  // Default: false
+  bool exclusive_manual_compaction = false;
+
   // If true, compacted files will be moved to the minimum level capable
   // of holding the data or given level (specified non-negative target_level).
   bool change_level = false;
@@ -1841,7 +1884,7 @@ struct CompactRangeOptions {
   uint32_t max_subcompactions = 0;
   // Set user-defined timestamp low bound, the data with older timestamp than
   // low bound maybe GCed by compaction. Default: nullptr
-  Slice* full_history_ts_low = nullptr;
+  const Slice* full_history_ts_low = nullptr;
 
   // Allows cancellation of an in-progress manual compaction.
   //
